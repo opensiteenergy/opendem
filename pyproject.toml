@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OpenDEM"
+version = "0.1.0"
+description = "A standalone library for Digital Elevation Model (DEM) data processing"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+  { name="Stefan Haselwimmer", email="haselwimmer@gmail.com" }
+]
+dependencies = [
+    "numpy",
+    "pyyaml",
+    "gdal",
+    "scipy"
+]
+
+[project.scripts]
+opendem = "opendem.core:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
