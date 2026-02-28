@@ -15,7 +15,7 @@ A `yml` configuration file is used to provide key parameters to the library.
 ## Installation
 
 ```
-pip install git+https://github.com/SH801/opendem.git
+pip install git+https://github.com/opensiteenergy/opendem.git
 ```
 
 To use the library, enter:
@@ -37,7 +37,7 @@ The `.yml` configuration file should have the following format:
 # Link to this GitHub code repository 
 # This can be used to host yml files on an open data server and automatically install required library just-in-time
 codebase:
-  https://github.com/SH801/opendem.git
+  https://github.com/opensiteenergy/opendem.git
 
 # Link to Mapzen Terrarium bucket on AWS (RGB-encoded PNGs)
 source:
@@ -57,8 +57,8 @@ resolution:
 
 # External URL or path to a geometry file used to crop the output to a specific shape
 clipping:
-  https://github.com/open-wind/openwindenergy/raw/refs/heads/main/overall-clipping.gpkg
-
+  https://github.com/opensiteenergy/opensiteenergy/raw/refs/heads/main/clipping-master-EPSG-25830.gpkg
+  
 # The GDAL operation to run (e.g., slope, aspect, hillshade, roughness)
 process:
   slope
