@@ -7,10 +7,17 @@ import subprocess
 import sys
 import numpy as np
 import geopandas as gpd
+import threading
 import concurrent.futures
 from shapely.geometry import box
 from osgeo import gdal, osr
-from scipy.ndimage import gaussian_filter, median_filter, grey_opening, grey_closing
+from scipy.ndimage import (
+    gaussian_filter, 
+    median_filter,
+    uniform_filter,
+    grey_closing, 
+    grey_opening
+)
 
 # # Disable GDAL's Persistent Auxiliary Metadata (PAM) to prevent .aux.xml files
 # gdal.SetConfigOption('GDAL_PAM_ENABLED', 'NO')
@@ -24,7 +31,9 @@ class OpenDEMExporter:
             
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
+        self.failed_tiles = set()
+        self.multithread_lock = threading.Lock()
         self.cache_dir = os.path.abspath(self.config.get('cache_dir', './cache'))
         self.tile_cache = os.path.join(self.cache_dir, 'tiles')
         os.makedirs(self.tile_cache, exist_ok=True)
@@ -33,7 +42,7 @@ class OpenDEMExporter:
         self.source_url_template = self.config['source']
         self.clipping_url = self.config.get('clipping')
         self.output = self.config.get('output')
-        self.grid_size = float(self.config.get('grid_size', 10000.0))
+        self.grid_size = float(self.config.get('grid_size', 20000.0))
         self.res = float(self.config.get('resolution', 1.0))
         self.buffer_m = float(self.config.get('buffer_meters', 500.0))
         
@@ -74,8 +83,9 @@ class OpenDEMExporter:
         target_tile_name = f"{target_z}_{target_x}_{target_y}.webp"
         target_local_path = os.path.join(self.tile_cache, target_tile_name)
         
-        if target_local_path not in self.current_run_tiles:
-            self.current_run_tiles.append(target_local_path)
+        with self.multithread_lock:
+            if target_local_path not in self.current_run_tiles:
+                self.current_run_tiles.append(target_local_path)
         
         # --- PHASE 1: DATA ACQUISITION ---
         current_tile_name = f"{z}_{x}_{y}.webp"
@@ -85,84 +95,100 @@ class OpenDEMExporter:
             url = self.source_url_template.replace('{z}', str(z)).replace('{x}', str(x)).replace('{y}', str(y))
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
-                response = requests.get(url, timeout=10, headers=headers)
-                
+                failed_cache = False
+
+                with self.multithread_lock:
+                    if url in self.failed_tiles: failed_cache = True
+
+                if failed_cache:
+                    response = {"status_code": 404}
+                else:
+                    response = requests.get(url, timeout=10, headers=headers)
+
                 if response.status_code == 404:
+                    with self.multithread_lock:
+                        if url not in self.failed_tiles:
+                            self.failed_tiles.add(url)
+                        
                     if z <= 10: return None
                     # Recurse up to find parent data
-                    print(f" --> Unable to retrieve tile for {x} {y} {z} - moving up to {z - 1}")
+                    # print(f" --> Unable to retrieve tile for {x} {y} {z} - moving up to {z - 1}")
                     return self.fetch_tile(x // 2, y // 2, z - 1, target_x, target_y, target_z)
 
                 print(f" --> Successfully retrieved tile for {x} {y} {z}")
 
                 response.raise_for_status()
-                with open(current_local_path, 'wb') as f:
-                    f.write(response.content)
+                with self.multithread_lock:
+                    with open(current_local_path, 'wb') as f:
+                        f.write(response.content)
             except Exception:
                 return None
 
         # --- PHASE 2: PROCESSING ---
-        src_ds = gdal.Open(current_local_path)
-        if not src_ds:
-            return None
-        
-        src_w, src_h = src_ds.RasterXSize, src_ds.RasterYSize
 
-        # FIX: Assign georeference to the source tile so ReprojectImage knows its location
-        tile_bounds = self.tile_to_mercator_bounds(x, y, z)
-        src_ds.SetGeoTransform([tile_bounds[0], (tile_bounds[2]-tile_bounds[0])/src_w, 0, tile_bounds[3], 0, -(tile_bounds[3]-tile_bounds[1])/src_h])
-        srs_src = osr.SpatialReference(); srs_src.ImportFromEPSG(3857)
-        src_ds.SetProjection(srs_src.ExportToWkt())
+        src_ds = None
+        with self.multithread_lock:
+            src_ds = gdal.Open(current_local_path)
+            if not src_ds:
+                return None
+        
+            src_w, src_h = src_ds.RasterXSize, src_ds.RasterYSize
 
-        out_w, out_h = 512, 512
-        
-        bounds = self.tile_to_mercator_bounds(target_x, target_y, target_z)
-        pixel_size_x = (bounds[2] - bounds[0]) / float(out_w)
-        pixel_size_y = (bounds[3] - bounds[1]) / float(out_h)
-        
-        mem_driver = gdal.GetDriverByName('MEM')
-        out_ds = mem_driver.Create('', out_w, out_h, src_ds.RasterCount, gdal.GDT_Byte)
-        out_ds.SetGeoTransform([bounds[0], pixel_size_x, 0, bounds[3], 0, -pixel_size_y])
-        
-        srs = osr.SpatialReference()
-        srs.ImportFromEPSG(3857)
-        out_ds.SetProjection(srs.ExportToWkt())
+            # FIX: Assign georeference to the source tile so ReprojectImage knows its location
+            tile_bounds = self.tile_to_mercator_bounds(x, y, z)
+            src_ds.SetGeoTransform([tile_bounds[0], (tile_bounds[2]-tile_bounds[0])/src_w, 0, tile_bounds[3], 0, -(tile_bounds[3]-tile_bounds[1])/src_h])
+            srs_src = osr.SpatialReference(); srs_src.ImportFromEPSG(3857)
+            src_ds.SetProjection(srs_src.ExportToWkt())
 
-        # --- PHASE 3: INTERPOLATION (The Anti-Artifact Fix) ---
-        # We switch from Bilinear to Cubicspline. 
-        # Bilinear is C0 continuous (values match), but not C1 continuous (slopes don't match).
-        # Cubicspline provides C1 continuity, removing the "grid" lines in slope analysis.
-        
-        if z == target_z:
-            gdal.ReprojectImage(src_ds, out_ds, None, None, gdal.GRA_CubicSpline)
-        else:
-            scale = 2 ** (target_z - z)
-            win_w, win_h = src_w / scale, src_h / scale
-            win_x, win_y = (target_x % scale) * win_w, (target_y % scale) * win_h
+            out_w, out_h = 512, 512
             
-            for i in range(1, src_ds.RasterCount + 1):
-                data = src_ds.GetRasterBand(i).ReadAsArray(
-                    int(win_x), int(win_y), int(win_w), int(win_h), 
-                    buf_xsize=out_w, buf_ysize=out_h, 
-                    resample_alg=gdal.GRIORA_CubicSpline
-                )
-                if data is not None:
-                    out_ds.GetRasterBand(i).WriteArray(data)
+            bounds = self.tile_to_mercator_bounds(target_x, target_y, target_z)
+            pixel_size_x = (bounds[2] - bounds[0]) / float(out_w)
+            pixel_size_y = (bounds[3] - bounds[1]) / float(out_h)
+            
+            mem_driver = gdal.GetDriverByName('MEM')
+            out_ds = mem_driver.Create('', out_w, out_h, src_ds.RasterCount, gdal.GDT_Byte)
+            out_ds.SetGeoTransform([bounds[0], pixel_size_x, 0, bounds[3], 0, -pixel_size_y])
+            
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(3857)
+            out_ds.SetProjection(srs.ExportToWkt())
 
-        # --- PHASE 4: PERSISTENCE ---
-        if not os.path.exists(target_local_path):
-            webp_driver = gdal.GetDriverByName('WEBP')
-            if webp_driver:
-                # Maintain LOSSLESS=YES to ensure no further artifacts are introduced by compression
-                saved_ds = webp_driver.CreateCopy(
-                    target_local_path, 
-                    out_ds, 
-                    strict=0, 
-                    options=["LOSSLESS=YES"]
-                )
-                saved_ds = None 
+            # --- PHASE 3: INTERPOLATION (The Anti-Artifact Fix) ---
+            # We switch from Bilinear to Cubicspline. 
+            # Bilinear is C0 continuous (values match), but not C1 continuous (slopes don't match).
+            # Cubicspline provides C1 continuity, removing the "grid" lines in slope analysis.
+            
+            if z == target_z:
+                gdal.ReprojectImage(src_ds, out_ds, None, None, gdal.GRA_CubicSpline)
+            else:
+                scale = 2 ** (target_z - z)
+                win_w, win_h = src_w / scale, src_h / scale
+                win_x, win_y = (target_x % scale) * win_w, (target_y % scale) * win_h
                 
-        return out_ds
+                for i in range(1, src_ds.RasterCount + 1):
+                    data = src_ds.GetRasterBand(i).ReadAsArray(
+                        int(win_x), int(win_y), int(win_w), int(win_h), 
+                        buf_xsize=out_w, buf_ysize=out_h, 
+                        resample_alg=gdal.GRIORA_CubicSpline
+                    )
+                    if data is not None:
+                        out_ds.GetRasterBand(i).WriteArray(data)
+
+            # --- PHASE 4: PERSISTENCE ---
+            if not os.path.exists(target_local_path):
+                webp_driver = gdal.GetDriverByName('WEBP')
+                if webp_driver:
+                    # Maintain LOSSLESS=YES to ensure no further artifacts are introduced by compression
+                    saved_ds = webp_driver.CreateCopy(
+                        target_local_path, 
+                        out_ds, 
+                        strict=0, 
+                        options=["LOSSLESS=YES"]
+                    )
+                    saved_ds = None 
+                    
+            return out_ds
         
     def filter_slender_polygons(self, gpkg_path):
         """
@@ -218,16 +244,6 @@ class OpenDEMExporter:
             print(f"Re-merging {len(filtered_files)} filtered cells into {self.output}...")
             subprocess.run(["ogrmerge.py", "-single", "-o", self.output] + filtered_files + ["-overwrite_ds"], check=True)
             print("Done.")
-
-    def get_original_coords_for_recursion(self, x, y, z, target_z):
-        """
-        This is a helper to keep track of the bottom-level tile we actually wanted
-        while the recursion is moving 'up' the tree. 
-        In a real implementation, you'd likely pass the target_x/y down the recursion.
-        """
-        # For this snippet, assume the first call to fetch_tile stores the target_x/y 
-        # in the object state or passes them as arguments.
-        return self.last_requested_x, self.last_requested_y
         
     def decode_terrarium(self, rgb_array):
         if rgb_array.shape[0] < 3:
@@ -236,11 +252,32 @@ class OpenDEMExporter:
         height = (r * 256.0 + g + b / 256.0) - 32768.0
         return median_filter(height, size=3)
 
+    # def advanced_dtm_filter(self, dtm_array):
+    #     footprint_size = 30 
+    #     temp = grey_closing(dtm_array, size=(footprint_size + 4, footprint_size + 4))
+    #     cleaned = grey_opening(temp, size=(footprint_size, footprint_size))
+    #     return gaussian_filter(cleaned, sigma=4)
+
     def advanced_dtm_filter(self, dtm_array):
-        footprint_size = 30 
-        temp = grey_closing(dtm_array, size=(footprint_size + 4, footprint_size + 4))
-        cleaned = grey_opening(temp, size=(footprint_size, footprint_size))
-        return gaussian_filter(cleaned, sigma=4)
+        """
+        Tuned pipeline to eliminate 1m-quantization 'rings' while 
+        preserving the general terrain shape.
+        """
+        # 1. INITIAL BOX BLUR (Size 3)
+        # This slightly softens the 'pixel-perfect' steps so the median 
+        # filter doesn't treat them as valid signal.
+        smeared = uniform_filter(dtm_array, size=3)
+        
+        # 2. MEDIAN FILTER (Size 5) - THE KEY STEP
+        # This is non-linear. It looks at a 5x5 window and picks the middle value.
+        # It is excellent at removing the 'terracing' effect that causes slope rings.
+        denoised = median_filter(smeared, size=5)
+        
+        # 3. INCREASED GAUSSIAN BLUR (Sigma 6-8)
+        # Now that the 'steps' are mathematically broken by the median filter, 
+        # the Gaussian blur can create a truly smooth surface for slope calculation.
+        # Sigma 7 is a good 'sweet spot' for 1-2m resolution data.
+        return gaussian_filter(denoised, sigma=7)
 
     def calculate_slope(self, dtm_array, resolution):
         dy, dx = np.gradient(dtm_array, resolution)
@@ -284,7 +321,25 @@ class OpenDEMExporter:
                 except Exception as e:
                     print(f"Tile {coord} generated an exception: {e}")
 
-        return tile_datasets
+    def fetch_local_tile(self, x, y, z):
+        """
+        Synchronously loads a tile from the local cache.
+        Returns a GDAL dataset or None if the file is missing/corrupt.
+        """
+
+        current_tile_name = f"{z}_{x}_{y}.webp"
+        current_local_path = os.path.join(self.tile_cache, current_tile_name)
+        
+        if not os.path.exists(current_local_path):
+            return None
+            
+        try:
+            # Open the local file. Using GA_ReadOnly for safety.
+            ds = gdal.Open(current_local_path, gdal.GA_ReadOnly)
+            return ds
+        except Exception as e:
+            print(f"Failed to load local tile {x}, {y}: {e}")
+            return None
 
     def process_grid_cell(self, cell_bounds_3857, cell_id):
         """
@@ -324,7 +379,13 @@ class OpenDEMExporter:
             x_range = range(min(start_x, end_x), max(start_x, end_x) + 1)
             y_range = range(min(start_y, end_y), max(start_y, end_y) + 1)
             
-            tile_datasets = self.fetch_all_tiles(x_range, y_range)
+            self.fetch_all_tiles(x_range, y_range)
+
+            for x in x_range:
+                for y in y_range:
+                    ds = self.fetch_local_tile(x, y, self.zoom)
+                    if ds: 
+                        tile_datasets.append(ds)
 
             if not tile_datasets: 
                 print(f"Cell {cell_id}: No source tiles found in coverage area.")
@@ -345,13 +406,23 @@ class OpenDEMExporter:
                 print(f"Cell {cell_id}: Raster data is empty/zero.")
                 return None
 
+            # dtm_buff = self.decode_terrarium(rgb)
             dtm_buff = self.advanced_dtm_filter(self.decode_terrarium(rgb))
             slope_buff = self.calculate_slope(dtm_buff, self.res)
 
+            temp_dtm_tif = os.path.join(self.cache_dir, f"temp_dtm_{cell_id}.tif")
             temp_slope_tif = os.path.join(self.cache_dir, f"temp_slope_{cell_id}.tif")
             temp_gpkg = os.path.join(self.cache_dir, f"temp_vec_{cell_id}.gpkg")
-            
+
             drv = gdal.GetDriverByName('GTiff')
+
+            ds_dtm = drv.Create(temp_dtm_tif, buffered_ds.RasterXSize, buffered_ds.RasterYSize, 1, gdal.GDT_Float32)
+            ds_dtm.SetGeoTransform(buffered_ds.GetGeoTransform())
+            ds_dtm.SetProjection(buffered_ds.GetProjection())
+            ds_dtm.GetRasterBand(1).WriteArray(dtm_buff)
+            ds_dtm.FlushCache()
+            ds_dtm = None
+
             ds = drv.Create(temp_slope_tif, buffered_ds.RasterXSize, buffered_ds.RasterYSize, 1, gdal.GDT_Float32)
             ds.SetGeoTransform(buffered_ds.GetGeoTransform())
             ds.SetProjection(buffered_ds.GetProjection())
@@ -374,7 +445,7 @@ class OpenDEMExporter:
             ], check=True, capture_output=True)
 
             # Cleanup intermediate files
-            for f in [temp_slope_tif, temp_gpkg]:
+            for f in [temp_slope_tif, temp_gpkg, temp_dtm_tif]:
                 if os.path.exists(f): os.remove(f)
             
             return final_cell_gpkg
