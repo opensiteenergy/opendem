@@ -262,6 +262,9 @@ class OpenDEMExporter:
         Includes robust coordinate conversion and check for empty data.
         """
         try:
+            final_cell_gpkg = os.path.join(self.cache_dir, f"cell_{cell_id}.gpkg")
+            if os.path.exists(final_cell_gpkg): return final_cell_gpkg
+            
             # Ensure we are working with standard floats, not numpy types
             minx, miny, maxx, maxy = [float(b) for b in cell_bounds_3857]
             
@@ -338,7 +341,6 @@ class OpenDEMExporter:
             ], check=True, capture_output=True)
 
             # Final clip to the unbuffered grid cell boundaries
-            final_cell_gpkg = os.path.join(self.cache_dir, f"cell_{cell_id}.gpkg")
             subprocess.run([
                 "ogr2ogr", "-f", "GPKG", final_cell_gpkg, temp_gpkg,
                 "-clipsrc", str(minx), str(miny), str(maxx), str(maxy),
@@ -409,11 +411,6 @@ class OpenDEMExporter:
         
     def run_grid_processing(self):
 
-        # # For testing
-        # test_cell = [-15350.0, 6588500.0, -13350.0, 6590500.0] 
-        # self.process_grid_cell(test_cell, "cell_test")
-        # return 
-
         if not self.clipping_url:
             print("No clipping URL.")
             return
@@ -432,9 +429,6 @@ class OpenDEMExporter:
             cell_id = f"{cell_count}"
             cell_bounds = row.geometry.bounds # (minx, miny, maxx, maxy)
 
-            # # For testing
-            # if cell_count < 2: continue
-
             print(f"Processing cell {cell_id}, fid {idx + 1}: {cell_count}/{len(active_cells)} {cell_bounds}")
 
             result_file = self.process_grid_cell(cell_bounds, cell_id)
@@ -446,11 +440,37 @@ class OpenDEMExporter:
         # self.batch_filter_cache()
 
         if cell_files:
+            intermediate_merged = "temp_merged_unclipped.gpkg"
             print(f"Merging {len(cell_files)} cells...")
-            subprocess.run(["ogrmerge.py", "-single", "-o", self.output] + cell_files + ["-overwrite_ds"], check=True)
-            print(f"Done: {final_output}")
+            subprocess.run(["ogrmerge.py", "-single", "-o", intermediate_merged] + cell_files + ["-overwrite_ds"], check=True)
+
+            # 2. Clip the merged file to self.clipping
+            if hasattr(self, 'clipping') and os.path.exists(self.clipping):
+                print(f"Clipping merged file to {self.clipping}...")
+                # -clipsrc uses the geometry of the provided layer/file to clip the input
+                subprocess.run([
+                    "ogr2ogr",
+                    "-f", "GPKG",
+                    self.output,
+                    intermediate_merged,
+                    "-clipsrc", self.clipping,
+                    "-nlt", "PROMOTE_TO_MULTI" # Ensures geometry consistency after clipping
+                ], check=True)
+                
+                # Clean up the intermediate merged file
+                if os.path.exists(intermediate_merged):
+                    os.remove(intermediate_merged)
+                
+                print(f"Done! Final clipped output saved to: {self.output}")
+            else:
+                # If no clipping file exists, rename intermediate to final output
+                os.rename(intermediate_merged, self.output)
+                print(f"Done (No clipping applied): {self.output}")
+
+            # # Clean up intermediate files
             # for f in cell_files:
             #     if os.path.exists(f): os.remove(f)
+            
         else:
             print("No valid output generated for any cells.")
 
