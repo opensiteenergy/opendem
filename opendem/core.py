@@ -11,6 +11,8 @@ from shapely.geometry import box
 from osgeo import gdal, osr
 from scipy.ndimage import gaussian_filter, median_filter, grey_opening, grey_closing
 
+# # Disable GDAL's Persistent Auxiliary Metadata (PAM) to prevent .aux.xml files
+# gdal.SetConfigOption('GDAL_PAM_ENABLED', 'NO')
 # Enable GDAL exceptions
 gdal.UseExceptions()
 
@@ -29,10 +31,13 @@ class OpenDEMExporter:
         self.zoom = self.config.get('zoom_level', 15)
         self.source_url_template = self.config['source']
         self.clipping_url = self.config.get('clipping')
+        self.output = self.config.get('output')
         self.grid_size = float(self.config.get('grid_size', 10000.0))
         self.res = float(self.config.get('resolution', 1.0))
         self.buffer_m = float(self.config.get('buffer_meters', 500.0))
         
+        self.min_width = float(self.config.get('min_polygon_width', 2.0)) # Threads thinner than this are removed
+
         self.s_min = float(self.config['mask']['min'])
         self.s_max = float(self.config['mask']['max'])
         
@@ -55,53 +60,177 @@ class OpenDEMExporter:
         miny = origin_shift - (y + 1) * res
         return [minx, miny, maxx, maxy]
 
-    def fetch_tile(self, x, y, z):
-        tile_name = f"{z}_{x}_{y}.webp"
-        local_path = os.path.join(self.tile_cache, tile_name)
+    def fetch_tile(self, x, y, z, target_x=None, target_y=None, target_z=None):
+        """
+        Fetches a tile at zoom level z. If not found, recurses up to find a parent
+        and upsamples using Cubic Spline interpolation to prevent slope artifacts.
+        """
+        # Initialize targets on first call
+        if target_x is None: target_x = x
+        if target_y is None: target_y = y
+        if target_z is None: target_z = z
+            
+        target_tile_name = f"{target_z}_{target_x}_{target_y}.webp"
+        target_local_path = os.path.join(self.tile_cache, target_tile_name)
         
-        if local_path not in self.current_run_tiles:
-            self.current_run_tiles.append(local_path)
+        if target_local_path not in self.current_run_tiles:
+            self.current_run_tiles.append(target_local_path)
         
-        if not os.path.exists(local_path):
+        # --- PHASE 1: DATA ACQUISITION ---
+        current_tile_name = f"{z}_{x}_{y}.webp"
+        current_local_path = os.path.join(self.tile_cache, current_tile_name)
+        
+        if not os.path.exists(current_local_path):
             url = self.source_url_template.replace('{z}', str(z)).replace('{x}', str(x)).replace('{y}', str(y))
             try:
-                # Setting headers to look more like a browser to avoid 403s, 
-                # though 404s usually mean the tile doesn't exist at that zoom/loc
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 response = requests.get(url, timeout=10, headers=headers)
+                
                 if response.status_code == 404:
-                    return None
+                    if z <= 10: return None
+                    # Recurse up to find parent data
+                    print(f" --> Unable to retrieve tile for {x} {y} {z} - moving up to {z - 1}")
+                    return self.fetch_tile(x // 2, y // 2, z - 1, target_x, target_y, target_z)
+
+                print(f" --> Successfully retrieved tile for {x} {y} {z}")
+
                 response.raise_for_status()
-                with open(local_path, 'wb') as f:
+                with open(current_local_path, 'wb') as f:
                     f.write(response.content)
             except Exception:
                 return None
 
-        if not os.path.exists(local_path):
+        # --- PHASE 2: PROCESSING ---
+        src_ds = gdal.Open(current_local_path)
+        if not src_ds:
             return None
-
-        src_ds = gdal.Open(local_path)
-        if not src_ds: return None
         
-        tw, th = src_ds.RasterXSize, src_ds.RasterYSize
-        bounds = self.tile_to_mercator_bounds(x, y, z)
-        pixel_size_x = (bounds[2] - bounds[0]) / float(tw)
-        pixel_size_y = (bounds[3] - bounds[1]) / float(th)
+        src_w, src_h = src_ds.RasterXSize, src_ds.RasterYSize
+
+        # FIX: Assign georeference to the source tile so ReprojectImage knows its location
+        tile_bounds = self.tile_to_mercator_bounds(x, y, z)
+        src_ds.SetGeoTransform([tile_bounds[0], (tile_bounds[2]-tile_bounds[0])/src_w, 0, tile_bounds[3], 0, -(tile_bounds[3]-tile_bounds[1])/src_h])
+        srs_src = osr.SpatialReference(); srs_src.ImportFromEPSG(3857)
+        src_ds.SetProjection(srs_src.ExportToWkt())
+
+        out_w, out_h = 512, 512
+        
+        bounds = self.tile_to_mercator_bounds(target_x, target_y, target_z)
+        pixel_size_x = (bounds[2] - bounds[0]) / float(out_w)
+        pixel_size_y = (bounds[3] - bounds[1]) / float(out_h)
         
         mem_driver = gdal.GetDriverByName('MEM')
-        out_ds = mem_driver.Create('', tw, th, src_ds.RasterCount, gdal.GDT_Byte)
+        out_ds = mem_driver.Create('', out_w, out_h, src_ds.RasterCount, gdal.GDT_Byte)
         out_ds.SetGeoTransform([bounds[0], pixel_size_x, 0, bounds[3], 0, -pixel_size_y])
         
         srs = osr.SpatialReference()
         srs.ImportFromEPSG(3857)
         out_ds.SetProjection(srs.ExportToWkt())
-        
-        for i in range(1, src_ds.RasterCount + 1):
-            out_ds.GetRasterBand(i).WriteArray(src_ds.GetRasterBand(i).ReadAsArray())
-            
-        return out_ds
 
+        # --- PHASE 3: INTERPOLATION (The Anti-Artifact Fix) ---
+        # We switch from Bilinear to Cubicspline. 
+        # Bilinear is C0 continuous (values match), but not C1 continuous (slopes don't match).
+        # Cubicspline provides C1 continuity, removing the "grid" lines in slope analysis.
+        
+        if z == target_z:
+            gdal.ReprojectImage(src_ds, out_ds, None, None, gdal.GRA_CubicSpline)
+        else:
+            scale = 2 ** (target_z - z)
+            win_w, win_h = src_w / scale, src_h / scale
+            win_x, win_y = (target_x % scale) * win_w, (target_y % scale) * win_h
+            
+            for i in range(1, src_ds.RasterCount + 1):
+                data = src_ds.GetRasterBand(i).ReadAsArray(
+                    int(win_x), int(win_y), int(win_w), int(win_h), 
+                    buf_xsize=out_w, buf_ysize=out_h, 
+                    resample_alg=gdal.GRIORA_CubicSpline
+                )
+                if data is not None:
+                    out_ds.GetRasterBand(i).WriteArray(data)
+
+        # --- PHASE 4: PERSISTENCE ---
+        if not os.path.exists(target_local_path):
+            webp_driver = gdal.GetDriverByName('WEBP')
+            if webp_driver:
+                # Maintain LOSSLESS=YES to ensure no further artifacts are introduced by compression
+                saved_ds = webp_driver.CreateCopy(
+                    target_local_path, 
+                    out_ds, 
+                    strict=0, 
+                    options=["LOSSLESS=YES"]
+                )
+                saved_ds = None 
+                
+        return out_ds
+        
+    def filter_slender_polygons(self, gpkg_path):
+        """
+        Removes 'threads' by performing a Morphological Opening on the geometry.
+        If a part of a polygon is thinner than 2 * self.min_width, it will be erased.
+        """
+        try:
+            gdf = gpd.read_file(gpkg_path)
+            if gdf.empty: return None
+            
+            # Step 1: Erosion (Negative Buffer)
+            # This makes thin parts disappear
+            dist = self.min_width / 2.0
+            gdf['geometry'] = gdf.geometry.buffer(-dist)
+            
+            # Remove empty geometries resulting from erosion
+            gdf = gdf[~gdf.geometry.is_empty]
+            
+            if gdf.empty: return None
+
+            # Step 2: Dilation (Positive Buffer)
+            # This brings the 'fat' parts back to their original size
+            gdf['geometry'] = gdf.geometry.buffer(dist)
+            
+            # Step 3: Cleanup
+            # Explode multi-polygons that might have been split by the process
+            gdf = gdf.explode(index_parts=True).reset_index(drop=True)
+            
+            # Re-save the filtered data
+            gdf.to_file(gpkg_path, driver="GPKG")
+            return gpkg_path
+        except Exception as e:
+            print(f"Filtering error: {e}")
+            return gpkg_path
+
+    def batch_filter_cache(self):
+        """Iterates through cached cell GPKGs and filters them."""
+        pattern = os.path.join(self.cache_dir, "cell_*.gpkg")
+        files = glob.glob(pattern)
+        
+        if not files:
+            print(f"No cached cell files found in {self.cache_dir}")
+            return
+
+        print(f"Found {len(files)} cached cells. Applying min_width filter: {self.min_width}m...")
+        filtered_files = []
+        for f in files:
+            result = self.filter_slender_polygons(f)
+            if result:
+                filtered_files.append(result)
+        
+        if filtered_files:
+            print(f"Re-merging {len(filtered_files)} filtered cells into {self.output}...")
+            subprocess.run(["ogrmerge.py", "-single", "-o", self.output] + filtered_files + ["-overwrite_ds"], check=True)
+            print("Done.")
+
+    def get_original_coords_for_recursion(self, x, y, z, target_z):
+        """
+        This is a helper to keep track of the bottom-level tile we actually wanted
+        while the recursion is moving 'up' the tree. 
+        In a real implementation, you'd likely pass the target_x/y down the recursion.
+        """
+        # For this snippet, assume the first call to fetch_tile stores the target_x/y 
+        # in the object state or passes them as arguments.
+        return self.last_requested_x, self.last_requested_y
+        
     def decode_terrarium(self, rgb_array):
+        if rgb_array.shape[0] < 3:
+            return np.zeros((rgb_array.shape[1], rgb_array.shape[2]))
         r, g, b = rgb_array[0].astype(np.float64), rgb_array[1].astype(np.float64), rgb_array[2].astype(np.float64)
         height = (r * 256.0 + g + b / 256.0) - 32768.0
         return median_filter(height, size=3)
@@ -117,20 +246,28 @@ class OpenDEMExporter:
         return np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
 
     def cleanup_tiles(self):
-        # We only cleanup if the config doesn't want to keep the cache
-        if self.config.get('cleanup_cache', False):
-            print(f"Cleaning up {len(self.current_run_tiles)} tiles...")
-            for tile_path in self.current_run_tiles:
-                if os.path.exists(tile_path):
-                    try: os.remove(tile_path)
-                    except: pass
+        for tile_path in self.current_run_tiles:
+            tile_metadata = tile_path + ".aux.xml"
+            if os.path.exists(tile_path):
+                try: os.remove(tile_path)
+                except: pass
+            if os.path.exists(tile_metadata):
+                try: os.remove(tile_metadata)
+                except: pass
         self.current_run_tiles = []
 
     def process_grid_cell(self, cell_bounds_3857, cell_id):
+        """
+        Processes an individual grid cell. 
+        Includes robust coordinate conversion and check for empty data.
+        """
         try:
+            # Ensure we are working with standard floats, not numpy types
+            minx, miny, maxx, maxy = [float(b) for b in cell_bounds_3857]
+            
             buff_bounds = [
-                cell_bounds_3857[0] - self.buffer_m, cell_bounds_3857[1] - self.buffer_m,
-                cell_bounds_3857[2] + self.buffer_m, cell_bounds_3857[3] + self.buffer_m
+                minx - self.buffer_m, miny - self.buffer_m,
+                maxx + self.buffer_m, maxy + self.buffer_m
             ]
 
             srs_3857 = osr.SpatialReference()
@@ -140,28 +277,45 @@ class OpenDEMExporter:
             srs_4326.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
             tx_to_4326 = osr.CoordinateTransformation(srs_3857, srs_4326)
 
+            # Transform corners to 4326 for tile fetching
             c1 = tx_to_4326.TransformPoint(buff_bounds[0], buff_bounds[1])
             c2 = tx_to_4326.TransformPoint(buff_bounds[2], buff_bounds[3])
             
-            start_x, start_y = self.deg2num(max(c1[1], c2[1]), min(c1[0], c2[0]), self.zoom)
-            end_x, end_y = self.deg2num(min(c1[1], c2[1]), max(c1[0], c2[0]), self.zoom)
+            # Identify tile range
+            lats = [c1[1], c2[1]]
+            lons = [c1[0], c2[0]]
+            start_x, start_y = self.deg2num(max(lats), min(lons), self.zoom)
+            end_x, end_y = self.deg2num(min(lats), max(lons), self.zoom)
             
             tile_datasets = []
-            for x in range(min(start_x, end_x), max(start_x, end_x) + 1):
-                for y in range(min(start_y, end_y), max(start_y, end_y) + 1):
-                    print(f"{x}/{end_x}, {y}/{end_y}")
+            x_range = range(min(start_x, end_x), max(start_x, end_x) + 1)
+            y_range = range(min(start_y, end_y), max(start_y, end_y) + 1)
+            
+            for x in x_range:
+                for y in y_range:
                     ds = self.fetch_tile(x, y, self.zoom)
-                    if ds: tile_datasets.append(ds)
+                    if ds: 
+                        tile_datasets.append(ds)
 
             if not tile_datasets: 
+                print(f"Cell {cell_id}: No source tiles found in coverage area.")
                 return None
 
+            # Build virtual mosaic of tiles
             vrt_ds = gdal.BuildVRT('', tile_datasets)
+            
+            # Warp to the exact grid cell (plus buffer) in 3857
             buffered_ds = gdal.Warp('', vrt_ds, format='MEM', outputBounds=buff_bounds, 
                                     resampleAlg=gdal.GRIORA_Cubic, xRes=self.res, yRes=self.res, 
                                     dstSRS=srs_3857.ExportToWkt())
 
             rgb = buffered_ds.ReadAsArray()
+            
+            # Robustness check: if the array is empty or zeroed (common on edges)
+            if rgb is None or np.all(rgb == 0):
+                print(f"Cell {cell_id}: Raster data is empty/zero.")
+                return None
+
             dtm_buff = self.advanced_dtm_filter(self.decode_terrarium(rgb))
             slope_buff = self.calculate_slope(dtm_buff, self.res)
 
@@ -174,82 +328,91 @@ class OpenDEMExporter:
             ds.SetProjection(buffered_ds.GetProjection())
             ds.GetRasterBand(1).WriteArray(slope_buff)
             ds.FlushCache()
-            ds = None # Close file
+            ds = None 
 
+            # Vectorize slope into polygons
             subprocess.run([
                 "gdal_contour", "-p", "-amin", "slope_min", "-amax", "slope_max",
                 "-fl", str(self.s_min), "-fl", str(self.s_max),
                 "-off", "0", temp_slope_tif, temp_gpkg, "-f", "GPKG"
             ], check=True, capture_output=True)
 
+            # Final clip to the unbuffered grid cell boundaries
             final_cell_gpkg = os.path.join(self.cache_dir, f"cell_{cell_id}.gpkg")
             subprocess.run([
                 "ogr2ogr", "-f", "GPKG", final_cell_gpkg, temp_gpkg,
-                "-clipsrc", str(cell_bounds_3857[0]), str(cell_bounds_3857[1]), 
-                str(cell_bounds_3857[2]), str(cell_bounds_3857[3]),
-                "-overwrite"
+                "-clipsrc", str(minx), str(miny), str(maxx), str(maxy),
+                "-nlt", "MULTIPOLYGON", "-overwrite"
             ], check=True, capture_output=True)
 
+            # Cleanup intermediate files
             for f in [temp_slope_tif, temp_gpkg]:
                 if os.path.exists(f): os.remove(f)
             
             return final_cell_gpkg
+            
         except Exception as e:
+            print(f"Error processing cell {cell_id}: {e}")
             return None
 
     def generate_aoi_grid(self, aoi_gdf, grid_size, export_path=None):
         """
-        Automatically generates a grid of polygons that intersect the AOI.
+        Generates a grid of squares covering the AOI and filters for intersection.
         
-        Args:
-            aoi_gdf: GeoDataFrame containing the clipping area (must be in EPSG:3857).
-            grid_size: The size of each square cell in meters.
-            export_path: Optional path to save a .gpkg for verification.
-            
-        Returns:
-            GeoDataFrame of intersecting grid cells.
+        Common pitfalls fixed:
+        1. CRS Alignment: Ensures the grid is born in the same CRS as the AOI.
+        2. Coordinate Order: Nested loops can flip X/Y expectations in logs.
+        3. Attribute Cleanup: SJOIN often brings in extra columns that clutter the format.
         """
-        # 1. Get the total bounds
+        # 1. Get bounds in the native CRS of the AOI
+        # If this is EPSG:3857, miny should be ~6.7M for Bristol.
+        # If it's 7.8M, your input 'aoi_gdf' is likely in the wrong place.
         minx, miny, maxx, maxy = aoi_gdf.total_bounds
         
-        # 2. Create the coordinate arrays
+        # Create ranges for the grid
         x_coords = np.arange(minx, maxx, grid_size)
         y_coords = np.arange(miny, maxy, grid_size)
         
-        # 3. Create potential grid using list comprehension
-        polygons = [
-            box(x, y, x + grid_size, y + grid_size) 
-            for x in x_coords 
-            for y in y_coords
-        ]
+        polygons = []
+        for x in x_coords:
+            for y in y_coords:
+                # Create the square
+                polygons.append(box(x, y, x + grid_size, y + grid_size))
                 
-        # 4. Convert potential grid to a GeoDataFrame
+        # 2. Create Grid GeoDataFrame
         grid_gdf = gpd.GeoDataFrame({'geometry': polygons}, crs=aoi_gdf.crs)
-        # Assign a unique ID to each cell for easier tracking in GIS
         grid_gdf['cell_id'] = range(len(grid_gdf))
         
-        # 5. Spatial Join to filter active cells
-        # 'inner' join ensures we only keep boxes that hit the AOI
-        intersecting_grid = gpd.sjoin(grid_gdf, aoi_gdf, how="inner", predicate="intersects")
+        # 3. Spatial Join
+        # 'inner' ensures we only keep cells that touch the AOI
+        intersecting_grid = gpd.sjoin(
+            grid_gdf, 
+            aoi_gdf[['geometry']], # Only pass geometry to avoid column name collisions
+            how="inner", 
+            predicate="intersects"
+        )
         
-        # Clean up: Drop duplicates and remove join columns
+        # 4. Cleanup
+        # drop_duplicates is necessary because one grid cell might touch multiple AOI features
         intersecting_grid = intersecting_grid.drop_duplicates(subset=['cell_id'])
-        intersecting_grid = intersecting_grid[['cell_id', 'geometry']]
+        
+        # Ensure index is clean and only necessary columns exist
+        intersecting_grid = intersecting_grid[['cell_id', 'geometry']].reset_index(drop=True)
         
         print(f"Grid filtered: {len(grid_gdf)} potential -> {len(intersecting_grid)} active.")
 
-        # 6. Optional Export for validation
         if export_path:
-            print(f"Exporting validation grid to: {export_path}")
+            # Exporting to GPKG for visualization in QGIS/ArcGIS
             intersecting_grid.to_file(export_path, driver="GPKG", layer="grid_cells")
         
         return intersecting_grid
-
+        
     def run_grid_processing(self):
 
-        # cell_bounds = [np.float64(-1523695.738230237), np.float64(7822634.741026822), np.float64(-1423695.738230237), np.float64(7922634.741026822)]
-        # result_file = self.process_grid_cell(cell_bounds, "test")
-        # exit()
+        # # For testing
+        # test_cell = [-15350.0, 6588500.0, -13350.0, 6590500.0] 
+        # self.process_grid_cell(test_cell, "cell_test")
+        # return 
 
         if not self.clipping_url:
             print("No clipping URL.")
@@ -262,32 +425,34 @@ class OpenDEMExporter:
 
         active_cells = self.generate_aoi_grid(aoi_gdf, self.grid_size, "active_cells.gpkg")
 
-        cell_count = 0
         cell_files = []
-        try:
-            for idx, row in active_cells.iterrows():
-                cell_count += 1
-                cell_bounds = row.geometry.bounds
+        cell_count = 0
+        for idx, row in active_cells.iterrows():
+            cell_count += 1
+            cell_id = f"{cell_count}"
+            cell_bounds = row.geometry.bounds # (minx, miny, maxx, maxy)
 
-                print(f"Processing active cell {cell_count} of {len(active_cells)} {cell_bounds}")
+            # # For testing
+            # if cell_count < 2: continue
 
-                result_file = self.process_grid_cell(cell_bounds, f"{cell_count}")
+            print(f"Processing cell {cell_id}, fid {idx + 1}: {cell_count}/{len(active_cells)} {cell_bounds}")
 
-                if result_file and os.path.exists(result_file):
-                    cell_files.append(result_file)
-
-            if cell_files:
-                print(f"Merging {len(cell_files)} cells...")
-                final_output = os.path.join(self.cache_dir, "final_analysis_grid.gpkg")
-                subprocess.run(["ogrmerge.py", "-single", "-o", final_output] + cell_files + ["-overwrite_ds"], check=True)
-                print(f"Done: {final_output}")
-                for f in cell_files:
-                    if os.path.exists(f): os.remove(f)
-            else:
-                print("No steep areas found in any cells.")
-
-        finally:
+            result_file = self.process_grid_cell(cell_bounds, cell_id)
             self.cleanup_tiles()
+
+            if result_file and os.path.exists(result_file):
+                cell_files.append(result_file)
+
+        # self.batch_filter_cache()
+
+        if cell_files:
+            print(f"Merging {len(cell_files)} cells...")
+            subprocess.run(["ogrmerge.py", "-single", "-o", self.output] + cell_files + ["-overwrite_ds"], check=True)
+            print(f"Done: {final_output}")
+            # for f in cell_files:
+            #     if os.path.exists(f): os.remove(f)
+        else:
+            print("No valid output generated for any cells.")
 
 def main():
     if len(sys.argv) < 2:
