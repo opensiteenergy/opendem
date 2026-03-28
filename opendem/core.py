@@ -7,6 +7,7 @@ import subprocess
 import sys
 import numpy as np
 import geopandas as gpd
+import concurrent.futures
 from shapely.geometry import box
 from osgeo import gdal, osr
 from scipy.ndimage import gaussian_filter, median_filter, grey_opening, grey_closing
@@ -256,6 +257,35 @@ class OpenDEMExporter:
                 except: pass
         self.current_run_tiles = []
 
+    def fetch_all_tiles(self, x_range, y_range):
+        """
+        Replaces the nested loop with a parallel thread pool to speed up tile downloads.
+        """
+        tile_datasets = []
+        
+        # Create a list of all (x, y) pairs to download
+        coords = [(x, y) for x in x_range for y in y_range]
+        
+        # Use ThreadPoolExecutor for I/O bound network requests
+        # max_workers=10 is a safe starting point; increase if the server allows
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            # We wrap the call in a lambda or a small helper to pass self.zoom
+            future_to_tile = {
+                executor.submit(self.fetch_tile, x, y, self.zoom): (x, y) 
+                for x, y in coords
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_tile):
+                coord = future_to_tile[future]
+                try:
+                    ds = future.result()
+                    if ds:
+                        tile_datasets.append(ds)
+                except Exception as e:
+                    print(f"Tile {coord} generated an exception: {e}")
+
+        return tile_datasets
+
     def process_grid_cell(self, cell_bounds_3857, cell_id):
         """
         Processes an individual grid cell. 
@@ -294,11 +324,7 @@ class OpenDEMExporter:
             x_range = range(min(start_x, end_x), max(start_x, end_x) + 1)
             y_range = range(min(start_y, end_y), max(start_y, end_y) + 1)
             
-            for x in x_range:
-                for y in y_range:
-                    ds = self.fetch_tile(x, y, self.zoom)
-                    if ds: 
-                        tile_datasets.append(ds)
+            tile_datasets = self.fetch_all_tiles(x_range, y_range)
 
             if not tile_datasets: 
                 print(f"Cell {cell_id}: No source tiles found in coverage area.")
@@ -470,7 +496,7 @@ class OpenDEMExporter:
             # # Clean up intermediate files
             # for f in cell_files:
             #     if os.path.exists(f): os.remove(f)
-            
+
         else:
             print("No valid output generated for any cells.")
 
