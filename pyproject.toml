@@ -15,7 +15,8 @@ dependencies = [
     "numpy",
     "pyyaml",
     "gdal",
-    "scipy"
+    "scipy",
+    "shapely"
 ]
 
 [project.scripts]
