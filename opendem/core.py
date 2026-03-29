@@ -97,8 +97,8 @@ class OpenDEMExporter:
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 failed_cache = False
 
-                with self.multithread_lock:
-                    if url in self.failed_tiles: failed_cache = True
+                # with self.multithread_lock:
+                #     if url in self.failed_tiles: failed_cache = True
 
                 if failed_cache:
                     response = {"status_code": 404}
@@ -106,9 +106,9 @@ class OpenDEMExporter:
                     response = requests.get(url, timeout=10, headers=headers)
 
                 if response.status_code == 404:
-                    with self.multithread_lock:
-                        if url not in self.failed_tiles:
-                            self.failed_tiles.add(url)
+                    # with self.multithread_lock:
+                    #     if url not in self.failed_tiles:
+                    #         self.failed_tiles.add(url)
                         
                     if z <= 10: return None
                     # Recurse up to find parent data
@@ -533,8 +533,6 @@ class OpenDEMExporter:
 
             if result_file and os.path.exists(result_file):
                 cell_files.append(result_file)
-
-        # self.batch_filter_cache()
 
         if cell_files:
             intermediate_merged = "temp_merged_unclipped.gpkg"
