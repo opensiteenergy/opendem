@@ -9,6 +9,7 @@ import numpy as np
 import geopandas as gpd
 import threading
 import concurrent.futures
+from urllib.parse import urlparse
 from shapely.geometry import box
 from osgeo import gdal, osr
 from scipy.ndimage import (
@@ -40,7 +41,7 @@ class OpenDEMExporter:
         
         self.zoom = self.config.get('zoom_level', 15)
         self.source_url_template = self.config['source']
-        self.clipping_url = self.config.get('clipping')
+        self.clipping = self.config.get('clipping')
         self.output = self.config.get('output')
         self.grid_size = float(self.config.get('grid_size', 20000.0))
         self.res = float(self.config.get('resolution', 1.0))
@@ -508,12 +509,12 @@ class OpenDEMExporter:
         
     def run_grid_processing(self):
 
-        if not self.clipping_url:
+        if not self.clipping:
             print("No clipping URL.")
             return
 
-        print(f"Loading AOI: {self.clipping_url}")
-        aoi_gdf = gpd.read_file(self.clipping_url)
+        print(f"Loading AOI: {self.clipping}")
+        aoi_gdf = gpd.read_file(self.clipping)
         if aoi_gdf.crs.to_epsg() != 3857:
             aoi_gdf = aoi_gdf.to_crs(epsg=3857)
 
@@ -535,32 +536,51 @@ class OpenDEMExporter:
                 cell_files.append(result_file)
 
         if cell_files:
-            intermediate_merged = "temp_merged_unclipped.gpkg"
-            print(f"Merging {len(cell_files)} cells...")
-            subprocess.run(["ogrmerge.py", "-single", "-o", intermediate_merged] + cell_files + ["-overwrite_ds"], check=True)
+            intermediate_merged = os.path.join(self.cache_dir, "temp_merged_unclipped.gpkg")
+            intermediate_file = intermediate_merged
+            if not os.path.exists(intermediate_merged):
+                print(f"Merging {len(cell_files)} cells...")
+                subprocess.run(["ogrmerge.py", "-single", "-o", intermediate_merged] + cell_files + ["-overwrite_ds"], check=True)
 
-            # 2. Clip the merged file to self.clipping
-            if hasattr(self, 'clipping') and os.path.exists(self.clipping):
-                print(f"Clipping merged file to {self.clipping}...")
-                # -clipsrc uses the geometry of the provided layer/file to clip the input
-                subprocess.run([
-                    "ogr2ogr",
-                    "-f", "GPKG",
-                    self.output,
-                    intermediate_merged,
-                    "-clipsrc", self.clipping,
-                    "-nlt", "PROMOTE_TO_MULTI" # Ensures geometry consistency after clipping
-                ], check=True)
-                
-                # Clean up the intermediate merged file
-                if os.path.exists(intermediate_merged):
-                    os.remove(intermediate_merged)
-                
-                print(f"Done! Final clipped output saved to: {self.output}")
-            else:
-                # If no clipping file exists, rename intermediate to final output
-                os.rename(intermediate_merged, self.output)
-                print(f"Done (No clipping applied): {self.output}")
+            # 1. Flexible check for local file OR URL
+            is_clipping_str = isinstance(self.clipping, str)
+            is_clipping_url = is_clipping_str and urlparse(self.clipping).scheme in ('http', 'https', 'ftp')
+            is_clipping_file = is_clipping_str and os.path.exists(self.clipping)
+            if is_clipping_url or is_clipping_file:
+                intermediate_clipped = os.path.join(self.cache_dir, "temp_merged_clipped.gpkg")
+
+                if not os.path.exists(intermediate_clipped):
+                    print(f"Clipping merged file using source: {self.clipping}...")
+
+                    # 2. Build the command
+                    # GDAL handles URLs natively via /vsicurl/ or direct string passing
+                    cmd = [
+                        "ogr2ogr",
+                        "-f", "GPKG",
+                        intermediate_clipped,
+                        intermediate_merged,
+                        "-clipsrc", self.clipping,
+                        "-nlt", "PROMOTE_TO_MULTI"
+                    ]
+
+                    # 3. Optional: GDAL config for better URL handling (timeouts, etc.)
+                    env = os.environ.copy()
+                    if is_clipping_url:
+                        env["GDAL_HTTP_RETRY_COUNT"] = "3"
+                        env["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".gpkg,.shp,.json,.geojson"
+
+                    subprocess.run(cmd, env=env, check=True)
+                    
+                    # Clean up the intermediate merged file
+                    if os.path.exists(intermediate_merged):
+                        os.remove(intermediate_merged)
+                    
+                    print(f"Done! Final clipped output saved to: {intermediate_clipped}")
+
+                intermediate_file = intermediate_clipped
+
+            shutil.move(intermediate_file, self.output)
+            print(f"Final output moved to: {self.output}")
 
             # # Clean up intermediate files
             # for f in cell_files:
