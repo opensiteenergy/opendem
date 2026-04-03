@@ -537,6 +537,7 @@ class OpenDEMExporter:
 
         if cell_files:
             intermediate_merged = os.path.join(self.cache_dir, "temp_merged_unclipped.gpkg")
+            intermediate_exploded = os.path.join(self.cache_dir, "temp_merged_clipped_exploded.gpkg")
             intermediate_file = intermediate_merged
             if not os.path.exists(intermediate_merged):
                 print(f"Merging {len(cell_files)} cells...")
@@ -579,7 +580,14 @@ class OpenDEMExporter:
 
                 intermediate_file = intermediate_clipped
 
-            shutil.move(intermediate_file, self.output)
+            if not os.path.exists(intermediate_exploded):
+                print(f"Exploding file: {intermediate_file} to {intermediate_exploded}")
+                gdf = gpd.read_file(intermediate_file)
+                gdf_dumped = gdf.explode()
+                gdf_dumped.to_file(intermediate_exploded, driver="GPKG")
+
+            exit()
+            shutil.move(intermediate_exploded, self.output)
             print(f"Final output moved to: {self.output}")
 
             # # Clean up intermediate files
