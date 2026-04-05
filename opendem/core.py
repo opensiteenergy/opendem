@@ -580,19 +580,18 @@ class OpenDEMExporter:
 
                 intermediate_file = intermediate_clipped
 
-            if not os.path.exists(intermediate_exploded):
-                print(f"Exploding file: {intermediate_file} to {intermediate_exploded}")
-                gdf = gpd.read_file(intermediate_file)
-                gdf_dumped = gdf.explode()
-                gdf_dumped.to_file(intermediate_exploded, driver="GPKG")
+            # if not os.path.exists(intermediate_exploded):
+            #     print(f"Exploding file: {intermediate_file} to {intermediate_exploded}")
+            #     gdf = gpd.read_file(intermediate_file)
+            #     gdf_dumped = gdf.explode()
+            #     gdf_dumped.to_file(intermediate_exploded, driver="GPKG")
 
-            exit()
-            shutil.move(intermediate_exploded, self.output)
+            shutil.move(intermediate_file, self.output)
             print(f"Final output moved to: {self.output}")
 
-            # # Clean up intermediate files
-            # for f in cell_files:
-            #     if os.path.exists(f): os.remove(f)
+            # Clean up intermediate files
+            for f in cell_files:
+                if os.path.exists(f): os.remove(f)
 
         else:
             print("No valid output generated for any cells.")
